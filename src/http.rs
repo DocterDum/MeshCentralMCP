@@ -20,6 +20,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Identifies the token's origin (like `ghp_`), so it is recognisable in config
+/// files and picked up by secret scanners.
+const TOKEN_PREFIX: &str = "meshmcp_";
+
 /// The token clients must present. Generated on first start (256 random bits)
 /// and kept in a file so it survives restarts; `--new-token` replaces it.
 fn load_or_create_token(new: bool) -> Result<(String, String)> {
@@ -27,14 +31,15 @@ fn load_or_create_token(new: bool) -> Result<(String, String)> {
     if !new {
         if let Ok(t) = std::fs::read_to_string(&path) {
             let t = t.trim().to_string();
-            if t.len() >= 32 {
+            if t.starts_with(TOKEN_PREFIX) && t.len() >= TOKEN_PREFIX.len() + 32 {
                 return Ok((t, path));
             }
         }
     }
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no secure random source: {e}"))?;
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let token = format!("{TOKEN_PREFIX}{hex}");
     std::fs::write(&path, &token).with_context(|| format!("writing {path}"))?;
     Ok((token, path))
 }
@@ -68,13 +73,13 @@ pub async fn serve(o: Options, mesh: Arc<Mesh>, cfg: Arc<Config>) -> Result<()> 
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 
-    anyhow::ensure!(
-        o.tls || o.addr.ip().is_loopback() || std::env::var("MCP_HTTP_ALLOW_REMOTE").as_deref() == Ok("1"),
-        "refusing to serve plain HTTP on {}: this endpoint can run commands on devices and the token \
-         would cross the network unencrypted. Use --https, bind to 127.0.0.1, or set MCP_HTTP_ALLOW_REMOTE=1 \
-         if a TLS reverse proxy sits in front",
-        o.addr
-    );
+    if !o.tls && !o.addr.ip().is_loopback() {
+        eprintln!(
+            "meshcentral-mcp: warning: plain HTTP on {} sends the bearer token unencrypted; \
+             use https, a TLS reverse proxy, or a loopback address",
+            o.addr
+        );
+    }
 
     let (token, token_path) = load_or_create_token(o.new_token)?;
     let svc = StreamableHttpService::new(

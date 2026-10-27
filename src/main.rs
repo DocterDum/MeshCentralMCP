@@ -13,15 +13,18 @@ fn env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is not set (see .env.example)"))
 }
 
-/// Value following `--flag`, if the flag is present.
-fn flag_value(args: &[String], flag: &str) -> Result<Option<String>> {
-    match args.iter().position(|a| a == flag) {
-        None => Ok(None),
-        Some(i) => args
-            .get(i + 1)
-            .cloned()
-            .map(Some)
-            .with_context(|| format!("{flag} needs a value")),
+/// `None` if the flag is absent, `Some(None)` if present without a value.
+fn flag(args: &[String], name: &str) -> Option<Option<String>> {
+    let i = args.iter().position(|a| a == name)?;
+    Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
+}
+
+/// Value of `--name <value>`, falling back to an environment variable.
+fn setting(args: &[String], name: &str, var: &str) -> Result<Option<String>> {
+    match flag(args, name) {
+        Some(Some(v)) => Ok(Some(v)),
+        Some(None) => anyhow::bail!("{name} needs a value"),
+        None => Ok(std::env::var(var).ok().filter(|v| !v.is_empty())),
     }
 }
 
@@ -38,18 +41,34 @@ async fn main() -> Result<()> {
         Credentials { user: env("MESH_TOKEN_USER")?, pass: env("MESH_TOKEN_PASS")? },
     ));
 
-    // `--http <addr>` or `--https <addr>` serves Streamable HTTP; the default is stdio.
+    // Transport: MCP_TRANSPORT in .env (stdio, http or https), or --http / --https.
+    // Flags override the environment. The default is stdio.
     let args: Vec<String> = std::env::args().collect();
-    let http = flag_value(&args, "--http")?;
-    let https = flag_value(&args, "--https")?;
-    anyhow::ensure!(http.is_none() || https.is_none(), "use either --http or --https, not both");
-    if let Some(addr) = https.clone().or(http) {
-        let addr = addr.parse().context("invalid listen address, e.g. 127.0.0.1:8808")?;
+    let flag_http = flag(&args, "--http");
+    let flag_https = flag(&args, "--https");
+    anyhow::ensure!(flag_http.is_none() || flag_https.is_none(), "use either --http or --https, not both");
+    let transport = if flag_https.is_some() {
+        "https".to_string()
+    } else if flag_http.is_some() {
+        "http".to_string()
+    } else {
+        std::env::var("MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into()).to_ascii_lowercase()
+    };
+    if transport != "stdio" {
+        anyhow::ensure!(
+            transport == "http" || transport == "https",
+            "MCP_TRANSPORT must be stdio, http or https"
+        );
+        let listen = flag_https
+            .or(flag_http)
+            .flatten()
+            .or_else(|| std::env::var("MCP_LISTEN").ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| "0.0.0.0:8808".into());
         let opts = http::Options {
-            addr,
-            tls: https.is_some(),
-            tls_cert: flag_value(&args, "--tls-cert")?,
-            tls_key: flag_value(&args, "--tls-key")?,
+            addr: listen.parse().with_context(|| format!("invalid listen address '{listen}'"))?,
+            tls: transport == "https",
+            tls_cert: setting(&args, "--tls-cert", "MCP_TLS_CERT")?,
+            tls_key: setting(&args, "--tls-key", "MCP_TLS_KEY")?,
             new_token: args.iter().any(|a| a == "--new-token"),
         };
         return http::serve(opts, mesh, cfg).await;
