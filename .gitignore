@@ -3,3 +3,4 @@
 *.log
 mcp-files/
 audit*.jsonl
+target/
