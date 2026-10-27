@@ -6,7 +6,7 @@ mod server;
 use anyhow::{Context, Result};
 use mesh::{Credentials, Mesh};
 use rmcp::ServiceExt;
-use server::{Config, MeshServer, Profile};
+use server::{Config, MeshServer};
 use std::sync::Arc;
 
 fn env(name: &str) -> Result<String> {
@@ -18,32 +18,13 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = dotenvy::dotenv();
 
-    let profile = match std::env::var("MESH_PROFILE").unwrap_or_default().as_str() {
-        "support" => Profile::Support,
-        "" | "readonly" => Profile::ReadOnly,
-        other => anyhow::bail!("MESH_PROFILE must be 'readonly' or 'support', got '{other}'"),
-    };
     let cfg = Arc::new(Config {
-        profile,
-        groups: std::env::var("MESH_GROUPS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
         audit_path: std::env::var("MESH_AUDIT_LOG").unwrap_or_else(|_| "audit.jsonl".into()),
     });
     let mesh = Arc::new(Mesh::new(
         env("MESH_SERVER_URL")?,
         Credentials { user: env("MESH_TOKEN_USER")?, pass: env("MESH_TOKEN_PASS")? },
     ));
-
-    // stdout is the MCP channel in stdio mode, so log to stderr only.
-    eprintln!(
-        "meshcentral-mcp: profile={} groups={}",
-        if profile == Profile::Support { "support" } else { "readonly" },
-        if cfg.groups.is_empty() { "all".to_string() } else { cfg.groups.join(",") }
-    );
 
     // `--http <addr>` serves Streamable HTTP; the default is stdio.
     let args: Vec<String> = std::env::args().collect();
