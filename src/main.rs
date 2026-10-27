@@ -1,6 +1,5 @@
 mod audit;
 mod mesh;
-mod safety;
 mod server;
 
 use anyhow::{Context, Result};

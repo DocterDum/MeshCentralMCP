@@ -1,7 +1,7 @@
 ﻿//! MCP tool surface. Transport-agnostic: main.rs serves this over stdio or HTTP.
 
-use crate::mesh::{Group, Mesh, Node, Shell};
-use crate::{audit, safety};
+use crate::audit;
+use crate::mesh::{Mesh, Shell};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -34,7 +34,7 @@ struct ListDevicesArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunCommandArgs {
-    /// Device name or full node id. Names must match exactly one device.
+    /// Full node id from mesh_list_devices (e.g. "node//...").
     device: String,
     /// The command to run.
     command: String,
@@ -90,8 +90,9 @@ impl MeshServer {
             .filter(|n| !a.online_only.unwrap_or(false) || n.online)
             .map(|n| {
                 format!(
-                    "{} | group: {} | {} | {}",
+                    "{} | id: {} | group: {} | {} | {}",
                     n.name,
+                    n.id,
                     gname(&n.group_id),
                     if n.online { "online" } else { "offline" },
                     n.os
@@ -114,45 +115,20 @@ impl MeshServer {
         let shell = Shell::parse(a.shell.as_deref().unwrap_or("auto")).map_err(|e| err(e.to_string()))?;
         let wait = Duration::from_secs(a.timeout_secs.unwrap_or(60).max(1));
 
-        let (groups, nodes) = self.mesh.inventory().await.map_err(internal)?;
-        let want = a.device.to_lowercase();
-        let by_id: Vec<&Node> = nodes.iter().filter(|n| n.id == a.device).collect();
-        let matches = if by_id.is_empty() {
-            nodes.iter().filter(|n| n.name.to_lowercase() == want).collect()
-        } else {
-            by_id
-        };
-        let node = match matches.as_slice() {
-            [one] => *one,
-            [] => return Err(err(format!("no device named '{}'", a.device))),
-            many => return Err(err(ambiguous(&a.device, many, &groups))),
-        };
-
         let started = std::time::Instant::now();
-        let result = self.mesh.run(node.id.clone(), shell, a.command.clone(), wait).await;
+        let result = self.mesh.run(a.device.clone(), shell, a.command.clone(), wait).await;
         audit::log(
             &self.cfg.audit_path,
             serde_json::json!({
-                "tool": "mesh_run_command", "device": node.name, "node_id": node.id,
+                "tool": "mesh_run_command", "node_id": a.device,
                 "shell": format!("{shell:?}"), "command": a.command,
                 "ok": result.is_ok(), "ms": started.elapsed().as_millis() as u64,
                 "output_bytes": result.as_ref().map(|s| s.len()).unwrap_or(0),
             }),
         );
         let out = result.map_err(internal)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(safety::wrap_output(&out))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
-}
-
-fn ambiguous(name: &str, many: &[&Node], groups: &[Group]) -> String {
-    let list: Vec<String> = many
-        .iter()
-        .map(|n| {
-            let g = groups.iter().find(|g| g.id == n.group_id).map(|g| g.name.as_str()).unwrap_or("?");
-            format!("{} (group {g}) id={}", n.name, n.id)
-        })
-        .collect();
-    format!("'{name}' matches several devices; retry with the full id:\n{}", list.join("\n"))
 }
 
 #[tool_handler(
