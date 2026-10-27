@@ -1,4 +1,5 @@
 mod audit;
+mod http;
 mod mesh;
 mod server;
 
@@ -10,6 +11,18 @@ use std::sync::Arc;
 
 fn env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is not set (see .env.example)"))
+}
+
+/// Value following `--flag`, if the flag is present.
+fn flag_value(args: &[String], flag: &str) -> Result<Option<String>> {
+    match args.iter().position(|a| a == flag) {
+        None => Ok(None),
+        Some(i) => args
+            .get(i + 1)
+            .cloned()
+            .map(Some)
+            .with_context(|| format!("{flag} needs a value")),
+    }
 }
 
 #[tokio::main]
@@ -25,15 +38,21 @@ async fn main() -> Result<()> {
         Credentials { user: env("MESH_TOKEN_USER")?, pass: env("MESH_TOKEN_PASS")? },
     ));
 
-    // `--http <addr>` serves Streamable HTTP; the default is stdio.
+    // `--http <addr>` or `--https <addr>` serves Streamable HTTP; the default is stdio.
     let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "--http") {
-        let addr: std::net::SocketAddr = args
-            .get(i + 1)
-            .context("--http needs an address, e.g. 127.0.0.1:8808")?
-            .parse()
-            .context("invalid --http address")?;
-        return serve_http(addr, mesh, cfg).await;
+    let http = flag_value(&args, "--http")?;
+    let https = flag_value(&args, "--https")?;
+    anyhow::ensure!(http.is_none() || https.is_none(), "use either --http or --https, not both");
+    if let Some(addr) = https.clone().or(http) {
+        let addr = addr.parse().context("invalid listen address, e.g. 127.0.0.1:8808")?;
+        let opts = http::Options {
+            addr,
+            tls: https.is_some(),
+            tls_cert: flag_value(&args, "--tls-cert")?,
+            tls_key: flag_value(&args, "--tls-key")?,
+            new_token: args.iter().any(|a| a == "--new-token"),
+        };
+        return http::serve(opts, mesh, cfg).await;
     }
 
     let svc = MeshServer::new(mesh, cfg)
@@ -41,52 +60,5 @@ async fn main() -> Result<()> {
         .await
         .context("failed to start MCP server on stdio")?;
     svc.waiting().await?;
-    Ok(())
-}
-
-/// Constant-time byte comparison, so the bearer check doesn't leak length-prefix timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-async fn serve_http(addr: std::net::SocketAddr, mesh: Arc<Mesh>, cfg: Arc<Config>) -> Result<()> {
-    use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
-    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
-
-    let token = env("MCP_HTTP_TOKEN")?;
-    anyhow::ensure!(token.len() >= 24, "MCP_HTTP_TOKEN must be at least 24 characters");
-    anyhow::ensure!(
-        addr.ip().is_loopback() || std::env::var("MCP_HTTP_ALLOW_REMOTE").as_deref() == Ok("1"),
-        "refusing to bind {addr}: this endpoint has command access to devices and speaks plain HTTP. \
-         Bind to 127.0.0.1, or put a TLS reverse proxy in front and set MCP_HTTP_ALLOW_REMOTE=1"
-    );
-
-    let svc = StreamableHttpService::new(
-        move || Ok(MeshServer::new(mesh.clone(), cfg.clone())),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    );
-    let expected = format!("Bearer {token}");
-    let app = axum::Router::new().nest_service("/mcp", svc).layer(axum::middleware::from_fn(
-        move |req: Request, next: Next| {
-            let expected = expected.clone();
-            async move {
-                let ok = req
-                    .headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| ct_eq(v.as_bytes(), expected.as_bytes()));
-                if ok {
-                    Ok(next.run(req).await)
-                } else {
-                    Err::<Response, StatusCode>(StatusCode::UNAUTHORIZED)
-                }
-            }
-        },
-    ));
-    eprintln!("meshcentral-mcp: serving Streamable HTTP on http://{addr}/mcp (bearer token required)");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
     Ok(())
 }

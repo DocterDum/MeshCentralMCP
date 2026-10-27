@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -76,9 +77,19 @@ pub fn control_url(server: &str) -> Result<String> {
     Ok(format!("{base}/control.ashx"))
 }
 
+/// Result of waiting for a command: its output, or the id to check later.
+pub enum Outcome {
+    Done(String),
+    Pending(String),
+}
+
 struct Conn {
     ws: Ws,
     counter: u64,
+    /// Commands sent whose reply hasn't arrived yet.
+    pending: HashSet<String>,
+    /// Replies that arrived after their caller stopped waiting.
+    late: HashMap<String, String>,
 }
 
 impl Conn {
@@ -92,7 +103,7 @@ impl Conn {
             .await
             .context("connect timed out")?
             .context("websocket handshake failed (bad URL, TLS error, or login rejected)")?;
-        Ok(Self { ws, counter: 0 })
+        Ok(Self { ws, counter: 0, pending: HashSet::new(), late: HashMap::new() })
     }
 
     async fn send(&mut self, v: &Value) -> Result<()> {
@@ -128,6 +139,7 @@ impl Conn {
             let Some(v) = self.next_json(left).await? else {
                 bail!("timed out waiting for the device list");
             };
+            self.absorb(&v);
             match v["action"].as_str() {
                 Some("meshes") => {
                     groups = Some(
@@ -163,7 +175,18 @@ impl Conn {
         Ok((groups.unwrap(), nodes.unwrap()))
     }
 
-    async fn run(&mut self, node: &str, shell: Shell, cmd: &str, wait: Duration) -> Result<String> {
+    /// Keep the result of a timed-out command if its reply turns up later.
+    fn absorb(&mut self, v: &Value) {
+        if v["action"] == "msg" && v["type"] == "runcommands" {
+            if let Some(rid) = v["responseid"].as_str() {
+                if self.pending.remove(rid) {
+                    self.late.insert(rid.to_string(), v["result"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+
+    async fn run(&mut self, node: &str, shell: Shell, cmd: &str, wait: Duration) -> Result<Outcome> {
         self.counter += 1;
         let rid = format!("run{}", self.counter);
         self.send(&json!({
@@ -171,19 +194,29 @@ impl Conn {
             "cmds": cmd, "runAsUser": 0, "reply": true, "responseid": rid
         }))
         .await?;
+        self.pending.insert(rid.clone());
+        self.wait_for(rid, wait).await
+    }
+
+    async fn wait_for(&mut self, rid: String, wait: Duration) -> Result<Outcome> {
         let deadline = Instant::now() + wait;
         loop {
+            if let Some(out) = self.late.remove(&rid) {
+                return Ok(Outcome::Done(out));
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             let Some(v) = self.next_json(left).await? else {
-                bail!(
-                    "no reply within {}s. The command may still be running on the device",
-                    wait.as_secs()
-                );
+                return Ok(Outcome::Pending(rid));
             };
-            if v["action"] == "msg" && v["type"] == "runcommands" && v["responseid"] == rid.as_str() {
-                return Ok(v["result"].as_str().unwrap_or_default().to_string());
-            }
+            self.absorb(&v);
         }
+    }
+
+    async fn result(&mut self, rid: &str, wait: Duration) -> Result<Outcome> {
+        if !self.pending.contains(rid) && !self.late.contains_key(rid) {
+            bail!("unknown command id '{rid}' (already collected, or the connection was reset since)");
+        }
+        self.wait_for(rid.to_string(), wait).await
     }
 }
 
@@ -218,8 +251,13 @@ impl Mesh {
         self.with_conn(|c| Box::pin(c.inventory())).await
     }
 
-    pub async fn run(&self, node: String, shell: Shell, cmd: String, wait: Duration) -> Result<String> {
+    pub async fn run(&self, node: String, shell: Shell, cmd: String, wait: Duration) -> Result<Outcome> {
         self.with_conn(move |c| Box::pin(async move { c.run(&node, shell, &cmd, wait).await }))
+            .await
+    }
+
+    pub async fn result(&self, id: String, wait: Duration) -> Result<Outcome> {
+        self.with_conn(move |c| Box::pin(async move { c.result(&id, wait).await }))
             .await
     }
 }

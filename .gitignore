@@ -4,3 +4,5 @@
 mcp-files/
 audit*.jsonl
 target/
+mcp-http-token.txt
+mcp-tls/

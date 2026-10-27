@@ -1,7 +1,7 @@
 ﻿//! MCP tool surface. Transport-agnostic: main.rs serves this over stdio or HTTP.
 
 use crate::audit;
-use crate::mesh::{Mesh, Shell};
+use crate::mesh::{Mesh, Outcome, Shell};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -42,6 +42,14 @@ struct RunCommandArgs {
     shell: Option<String>,
     /// Seconds to wait for output (default 60).
     timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetResultArgs {
+    /// The command_id returned by mesh_run_command.
+    command_id: String,
+    /// Seconds to wait for it if it hasn't finished (default 0: just check).
+    wait_secs: Option<u64>,
 }
 
 fn err(msg: impl Into<String>) -> ErrorData {
@@ -123,12 +131,34 @@ impl MeshServer {
                 "tool": "mesh_run_command", "node_id": a.device,
                 "shell": format!("{shell:?}"), "command": a.command,
                 "ok": result.is_ok(), "ms": started.elapsed().as_millis() as u64,
-                "output_bytes": result.as_ref().map(|s| s.len()).unwrap_or(0),
+                "output_bytes": match &result { Ok(Outcome::Done(s)) => s.len(), _ => 0 },
+                "pending": matches!(result, Ok(Outcome::Pending(_))),
             }),
         );
-        let out = result.map_err(internal)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        outcome_text(result.map_err(internal)?)
     }
+
+    #[tool(
+        description = "Collect the output of a command that mesh_run_command reported as still pending.",
+        annotations(read_only_hint = true)
+    )]
+    async fn mesh_get_result(
+        &self,
+        Parameters(a): Parameters<GetResultArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let wait = Duration::from_secs(a.wait_secs.unwrap_or(0));
+        outcome_text(self.mesh.result(a.command_id, wait).await.map_err(internal)?)
+    }
+}
+
+fn outcome_text(o: Outcome) -> Result<CallToolResult, ErrorData> {
+    let text = match o {
+        Outcome::Done(out) => out,
+        Outcome::Pending(id) => format!(
+            "No output yet. The command may still be running. Call mesh_get_result with command_id \"{id}\" to collect it."
+        ),
+    };
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 #[tool_handler(
