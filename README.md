@@ -60,6 +60,7 @@ A static bearer token is a stopgap, not real authentication; see the to-do below
 ## To-do
 
 - **OAuth 2.1 for the HTTP transport.** The MCP specification expects OAuth 2.1 (authorization code with PKCE, protected-resource and authorization-server metadata, dynamic client registration) for remote servers, and it is what remote connectors in Claude clients use. Planned: replace the static bearer token with it, ideally passing sign-in through to MeshCentral so each caller acts as their own MeshCentral user instead of sharing one login.
+- **Test the other shells.** Only `powershell` has been verified live. `cmd`, `sh` and `auto` still need testing on Windows, Linux and macOS devices.
 - Terminals, file transfer and remote-desktop screenshots.
 
 ## Status
