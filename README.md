@@ -1,4 +1,4 @@
-﻿# meshcentral-mcp
+﻿# MeshCentralMCP
 
 MCP server for MeshCentral, with human approval for every command.
 
